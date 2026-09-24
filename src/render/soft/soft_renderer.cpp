@@ -1,9 +1,91 @@
 #include "soft_renderer.hpp"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <algorithm>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 namespace fc {
+
+// Persistent worker pool for the rasterizer. Job 0-style sharing: every
+// worker (and the calling thread) pulls band indices from one atomic counter.
+class SoftWorkerPool {
+ public:
+  explicit SoftWorkerPool(int workers) {
+    for (int i = 1; i < workers; ++i)
+      workers_.emplace_back([this] { worker_loop(); });
+  }
+  ~SoftWorkerPool() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+      ++batch_;
+    }
+    cv_.notify_all();
+    for (auto& t : workers_) t.join();
+  }
+
+  // Runs fn(0..jobs-1) across all workers plus the calling thread; blocks
+  // until every job is finished.
+  void run(int jobs, const std::function<void(int)>& fn) {
+    if (jobs <= 0 || workers_.empty()) {
+      for (int j = 0; j < jobs; ++j) fn(j);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      fn_ = &fn;
+      jobs_ = jobs;
+      next_.store(0, std::memory_order_relaxed);
+      finished_ = 0;
+      ++batch_;
+    }
+    cv_.notify_all();
+    run_share(fn);  // the calling thread takes a share of the work
+    std::unique_lock<std::mutex> lk(m_);
+    done_cv_.wait(lk, [this] { return finished_ == (int)workers_.size(); });
+    fn_ = nullptr;
+  }
+
+ private:
+  void run_share(const std::function<void(int)>& fn) {
+    for (;;) {
+      int j = next_.fetch_add(1, std::memory_order_relaxed);
+      if (j >= jobs_) break;
+      fn(j);
+    }
+  }
+  void worker_loop() {
+    std::unique_lock<std::mutex> lk(m_);
+    // Pretend the worker has already "seen" one generation less than the
+    // current batch counter: a worker that starts while the first batch is
+    // being submitted must still wake up for it.
+    uint64_t seen = batch_ - 1;
+    for (;;) {
+      cv_.wait(lk, [&] { return batch_ != seen || stop_; });
+      if (stop_) return;
+      seen = batch_;
+      const std::function<void(int)>* fn = fn_;
+      lk.unlock();
+      run_share(*fn);
+      lk.lock();
+      if (++finished_ == (int)workers_.size()) done_cv_.notify_one();
+    }
+  }
+
+  std::vector<std::thread> workers_;
+  std::mutex m_;
+  std::condition_variable cv_, done_cv_;
+  const std::function<void(int)>* fn_ = nullptr;
+  std::atomic<int> next_{0};
+  int jobs_ = 0;
+  int finished_ = 0;
+  uint64_t batch_ = 0;
+  bool stop_ = false;
+};
 
 bool SoftRenderer::begin_frame(int width, int height) {
   if (width != W_ || height != H_) {
@@ -46,12 +128,23 @@ void SoftRenderer::clear(float r, float g, float b, float a) {
   uint8_t cg = (uint8_t)std::clamp((int)(g * 255.0f), 0, 255);
   uint8_t cb = (uint8_t)std::clamp((int)(b * 255.0f), 0, 255);
   uint8_t ca = (uint8_t)std::clamp((int)(a * 255.0f), 0, 255);
-  for (int y = y0; y < y1; ++y)
-    for (int x = x0; x < x1; ++x) {
-      size_t i = (size_t)(y * W_ + x) * 4;
-      back_[i] = cr; back_[i + 1] = cg; back_[i + 2] = cb; back_[i + 3] = ca;
-      depth_[(size_t)y * W_ + x] = 1.0f;
+  const uint32_t px32 =
+      (uint32_t)cr | ((uint32_t)cg << 8) | ((uint32_t)cb << 16) | ((uint32_t)ca << 24);
+  const uint64_t px64 = (uint64_t)px32 | ((uint64_t)px32 << 32);
+  for (int y = y0; y < y1; ++y) {
+    uint8_t* row = back_.data() + (size_t)y * W_ * 4;
+    int x = x0;
+    // Align to an 8-byte boundary, then fill two pixels (8 bytes) per store.
+    if (x < x1 && ((uintptr_t)(row + (size_t)x * 4)) & 7) {
+      std::memcpy(row + (size_t)x * 4, &px32, 4);
+      ++x;
     }
+    int pairs = (x1 - x) >> 1;
+    uint8_t* q = row + (size_t)x * 4;
+    for (int i = 0; i < pairs; ++i, q += 8) std::memcpy(q, &px64, 8);
+    if ((x1 - x) & 1) std::memcpy(q, &px32, 4);
+    std::fill(depth_.begin() + (size_t)y * W_ + x0, depth_.begin() + (size_t)y * W_ + x1, 1.0f);
+  }
 }
 
 void SoftRenderer::set_matrix(const char* name, const Mat4& m) {
@@ -90,12 +183,11 @@ MeshId SoftRenderer::builtin_quad() {
       -0.5f, 0.5f, 0, 0, 0, 1, 0, 0,
   };
   static uint32_t idx[6] = {0, 1, 2, 0, 2, 3};
-  static MeshId id = 0;
-  if (!id) {
+  if (!quad_id_) {
     Mesh m{verts, 4, idx, 6};
-    id = create_mesh(m);
+    quad_id_ = create_mesh(m);
   }
-  return id;
+  return quad_id_;
 }
 
 // ---------------------------------------------------------------- clipping
@@ -214,26 +306,34 @@ void SoftRenderer::draw(MeshId id) {
     for (int k = 1; k + 1 < clipn; ++k) {
       if (k > 1) attr_for(clip[k], vk);
       attr_for(clip[k + 1], vk1);
-      raster_triangle(v0, vk, vk1);
+
+      // Screen-space setup, then queue for band-parallel rasterization.
+      RasterTri t;
+      t.a = v0; t.b = vk; t.c = vk1;
+      float area2 = (vk.x - v0.x) * (vk1.y - v0.y) - (vk.y - v0.y) * (vk1.x - v0.x);
+      t.ccw = area2 > 0;
+      t.s2 = t.ccw ? area2 : -area2;
+      if (t.s2 < 1e-5f) continue;
+      float bx0 = std::min({v0.x, vk.x, vk1.x});
+      float by0 = std::min({v0.y, vk.y, vk1.y});
+      float bx1 = std::max({v0.x, vk.x, vk1.x});
+      float by1 = std::max({v0.y, vk.y, vk1.y});
+      t.ix0 = std::max(0, (int)std::floor(bx0));
+      t.iy0 = std::max(0, (int)std::floor(by0));
+      t.ix1 = std::min(W_, (int)std::ceil(bx1));
+      t.iy1 = std::min(H_, (int)std::ceil(by1));
+      if (t.ix1 <= t.ix0 || t.iy1 <= t.iy0) continue;
+      batch_.push_back(t);
     }
   }
+  flush_batch();
 }
 
-void SoftRenderer::raster_triangle(const NdcVertex a, const NdcVertex b, const NdcVertex c) {
-  float area2 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-  bool ccw = area2 > 0;
-  float s2 = ccw ? area2 : -area2;
-  if (s2 < 1e-5f) return;
-
-  float x0 = std::min({a.x, b.x, c.x});
-  float y0 = std::min({a.y, b.y, c.y});
-  float x1 = std::max({a.x, b.x, c.x});
-  float y1 = std::max({a.y, b.y, c.y});
-  int ix0 = std::max(0, (int)std::floor(x0));
-  int iy0 = std::max(0, (int)std::floor(y0));
-  int ix1 = std::min(W_, (int)std::ceil(x1));
-  int iy1 = std::min(H_, (int)std::ceil(y1));
-  if (ix1 <= ix0 || iy1 <= iy0) return;
+void SoftRenderer::raster_rows(const RasterTri& t, int ry0, int ry1, uint64_t& px_shaded) {
+  const NdcVertex& a = t.a;
+  const NdcVertex& b = t.b;
+  const NdcVertex& c = t.c;
+  float s2 = t.s2;
 
   auto edge = [](float ax, float ay, float bx, float by, float px, float py) {
     return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
@@ -243,14 +343,36 @@ void SoftRenderer::raster_triangle(const NdcVertex a, const NdcVertex b, const N
   Vec3 emissive = material_.emissive.xyz();
   bool lit = prog_ == ProgramKind::Lit;
 
-  for (int py = iy0; py < iy1; ++py) {
+  // Per-triangle point-light culling: every fragment's world position lies
+  // inside the triangle's world AABB, so a light farther than its radius
+  // from the AABB can never contribute (its attenuation is exactly 0 there).
+  bool pmask[kMaxPointLights];
+  bool* pmask_ptr = nullptr;
+  if (lit && lights_.numPoints > 0) {
+    float minx = std::min({a.wx, b.wx, c.wx}), maxx = std::max({a.wx, b.wx, c.wx});
+    float miny = std::min({a.wy, b.wy, c.wy}), maxy = std::max({a.wy, b.wy, c.wy});
+    float minz = std::min({a.wz, b.wz, c.wz}), maxz = std::max({a.wz, b.wz, c.wz});
+    for (int i = 0; i < lights_.numPoints; ++i) {
+      const PointLightSource& pl = lights_.points[i];
+      float dx = std::max(minx - pl.position.x,
+              std::max(0.0f, pl.position.x - maxx));
+      float dy = std::max(miny - pl.position.y,
+              std::max(0.0f, pl.position.y - maxy));
+      float dz = std::max(minz - pl.position.z,
+              std::max(0.0f, pl.position.z - maxz));
+      pmask[i] = dx * dx + dy * dy + dz * dz < pl.radius * pl.radius;
+    }
+    pmask_ptr = pmask;
+  }
+
+  for (int py = ry0; py < ry1; ++py) {
     float fy = py + 0.5f;
-    for (int px = ix0; px < ix1; ++px) {
+    for (int px = t.ix0; px < t.ix1; ++px) {
       float fx = px + 0.5f;
       float w0 = edge(b.x, b.y, c.x, c.y, fx, fy);
       float w1 = edge(c.x, c.y, a.x, a.y, fx, fy);
       float w2 = edge(a.x, a.y, b.x, b.y, fx, fy);
-      if (ccw) {
+      if (t.ccw) {
         if (w0 < 0 || w1 < 0 || w2 < 0) continue;
       } else {
         w0 = -w0; w1 = -w1; w2 = -w2;
@@ -273,10 +395,13 @@ void SoftRenderer::raster_triangle(const NdcVertex a, const NdcVertex b, const N
       float r = 0, g = 0, bl = 0, al = 1;
       if (lit) {
         Vec3 N{nx, ny, nz}, P{wx, wy, wz};
-        float nl = N.length();
-        if (nl > 1e-6f) { N.x /= nl; N.y /= nl; N.z /= nl; }
-        Vec3 V = (eye_ - P).normalized();
-        Vec3 L = light_fragment(N, V, P, material_, lights_, emissive);
+        float nl2 = N.lengthSq();
+        float inv = nl2 > 1e-12f ? 1.0f / std::sqrt(nl2) : 0.0f;  // reciprocal normalization
+        N = N * inv;
+        Vec3 dv = eye_ - P;
+        float vl2 = dv.lengthSq();
+        Vec3 V = vl2 > 1e-12f ? dv * (1.0f / std::sqrt(vl2)) : Vec3{0, 0, 0};
+        Vec3 L = light_fragment(N, V, P, material_, lights_, emissive, pmask_ptr);
         r = L.x; g = L.y; bl = L.z;
         al = material_.baseColor.w;
       } else {
@@ -314,10 +439,114 @@ void SoftRenderer::raster_triangle(const NdcVertex a, const NdcVertex b, const N
         back_[o + 2] = (uint8_t)std::clamp((int)(bl * 255.0f), 0, 255);
         back_[o + 3] = (uint8_t)std::clamp((int)(al * 255.0f), 0, 255);
       }
-      ++pixels_shaded_;
+      ++px_shaded;
     }
   }
-  ++triangles_rasterized_;
 }
+
+int SoftRenderer::resolve_threads() const {
+  if (threads_ > 0) return threads_;
+  unsigned hc = std::thread::hardware_concurrency();
+  int cores = hc ? (int)hc : 1;
+  return cores < 4 ? cores : 4;  // auto: min(4, cores)
+}
+
+void SoftRenderer::set_threads(int n) {
+  n = std::max(n, 0);
+  if (n == threads_) return;
+  threads_ = n;
+  pool_.reset();  // rebuilt (at the right size) on the next parallel batch
+  pool_threads_ = 0;
+}
+
+void SoftRenderer::ensure_pool(int threads) {
+  if (!pool_ || pool_threads_ != threads) {
+    pool_.reset();
+    pool_ = std::make_unique<SoftWorkerPool>(threads);  // spawns threads-1, caller joins in
+    pool_threads_ = threads;
+  }
+}
+
+void SoftRenderer::flush_batch() {
+  if (batch_.empty()) return;
+
+  // Parallelize only when there is enough fragment work to amortize the
+  // dispatch: total triangle-span coverage (rows) below the threshold stays
+  // on the serial path (typical for small UI sprite batches).
+  int64_t work = 0;
+  for (const RasterTri& t : batch_) work += t.iy1 - t.iy0;
+  int T = resolve_threads();
+  if (T > 1 && work >= 256 && H_ > 0) {
+    // Area-balanced scanline bands: weight each framebuffer row by the number
+    // of triangle spans covering it, then cut bands at equal cumulative
+    // weight so every thread gets a similar amount of fragment work.
+    row_weight_.assign(H_ + 1, 0);
+    for (const RasterTri& t : batch_) {
+      ++row_weight_[t.iy0];
+      --row_weight_[t.iy1];
+    }
+    int64_t total = 0, run = 0;
+    for (int y = 0; y < H_; ++y) {
+      run += row_weight_[y];
+      row_weight_[y] = (int)run;
+      total += run;
+    }
+    band_start_.assign(T + 1, H_);
+    band_start_[0] = 0;
+    int64_t target = (total + T - 1) / T;
+    int band = 1;
+    int64_t acc = 0;
+    for (int y = 0; y < H_ && band < T; ++y) {
+      acc += row_weight_[y];
+      if (acc >= target && H_ - (y + 1) >= T - band) {
+        band_start_[band++] = y + 1;
+        acc = 0;
+      }
+    }
+    // band_start_[band..T] stay H_: unused bands get empty row ranges.
+
+    band_px_.assign(T, 0);
+    band_tri_.assign(T, 0);
+    ensure_pool(T);
+    const std::vector<RasterTri>& tris = batch_;
+    const int* bs = band_start_.data();
+    uint64_t* bpx = band_px_.data();
+    uint64_t* btri = band_tri_.data();
+    pool_->run(T, [&](int b) {
+      int y0 = bs[b], y1 = bs[b + 1];
+      if (y0 >= y1) return;
+      uint64_t px = 0, tri = 0;
+      for (const RasterTri& t : tris) {
+        int ry0 = t.iy0 > y0 ? t.iy0 : y0;
+        int ry1 = t.iy1 < y1 ? t.iy1 : y1;
+        if (ry0 >= ry1) continue;
+        // Rows are disjoint across bands, so per-pixel state (depth test,
+        // blending) is race-free; submission order is kept within a band,
+        // which makes the result pixel-identical to the serial path.
+        raster_rows(t, ry0, ry1, px);
+        if (t.iy0 >= y0 && t.iy0 < y1) ++tri;  // count each triangle once
+      }
+      bpx[b] = px;
+      btri[b] = tri;
+    });
+    for (int b = 0; b < T; ++b) {
+      pixels_shaded_ += bpx[b];
+      triangles_rasterized_ += btri[b];
+    }
+  } else {
+    // Serial path (threads == 1 or tiny batches): identical math, same order
+    // as before threading.
+    for (const RasterTri& t : batch_) {
+      uint64_t px = 0;
+      raster_rows(t, t.iy0, t.iy1, px);
+      pixels_shaded_ += px;
+      ++triangles_rasterized_;
+    }
+  }
+  batch_.clear();
+}
+
+SoftRenderer::SoftRenderer() = default;
+SoftRenderer::~SoftRenderer() = default;
 
 }  // namespace fc

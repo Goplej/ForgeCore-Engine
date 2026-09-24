@@ -29,6 +29,7 @@ struct FrameData {
   FrameLights lights;
   float fps = 0;
   float frame_ms = 0;
+  float render_ms = 0;  // raw render-pass time of the previous frame (benchmarks)
   int frame_index = 0;
 };
 
@@ -36,6 +37,9 @@ struct EngineConfig {
   WindowConfig window;
   // "auto" | "soft" | "gl"
   std::string renderer = "auto";
+  // CPU rasterizer worker hint: 0 = auto (min(4, hardware cores)),
+  // 1 = serial. Ignored by non-CPU backends.
+  int renderer_threads = 0;
   // Headless preview streaming (/dev/shm frame + input + events).
   bool stream = false;
   std::string stream_dir = "/dev/shm";

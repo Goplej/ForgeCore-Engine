@@ -64,6 +64,7 @@ Engine::Engine(EngineConfig cfg) : cfg_(std::move(cfg)) {
     }
   }
   if (!use_gl) renderer_ = std::make_unique<SoftRenderer>();
+  renderer_->set_threads(cfg_.renderer_threads);
   renderer_name_ = renderer_->name();
 
   // 3. Audio + streaming
@@ -127,11 +128,16 @@ void Engine::run(std::function<void(Engine&)> on_init) {
     input_.end_frame();
 
     auto t0 = std::chrono::steady_clock::now();
+    auto r0 = std::chrono::steady_clock::now();
     render_frame();
+    double render_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0)
+            .count();
     audio_.update((float)dt);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
                     .count();
     frame_.frame_index++;
+    frame_.render_ms = (float)render_ms;  // raw last-frame render time (benchmarks)
     frame_.frame_ms = frame_.frame_ms * 0.9f + (float)ms * 0.1f;
     frame_.fps = frame_.fps * 0.9f + (float)(1.0 / std::max(dt, 1e-6)) * 0.1f;
 

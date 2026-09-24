@@ -43,6 +43,8 @@ class GLRenderer : public Renderer {
   void draw(MeshId id) override;
   MeshId builtin_quad() override;
 
+  FrameStats frame_stats() const override { return {triangles_drawn_, 0}; }
+
  private:
   struct MeshData {
     GLuint vbo = 0, ibo = 0;
@@ -60,6 +62,8 @@ class GLRenderer : public Renderer {
   int W_ = 0, H_ = 0;
   std::unordered_map<MeshId, MeshData> meshes_;
   uint32_t next_id_ = 1;
+  MeshId quad_id_ = 0;  // per-instance builtin quad cache
+  uint64_t triangles_drawn_ = 0;
 };
 
 }  // namespace fc
