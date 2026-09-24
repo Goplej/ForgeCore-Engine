@@ -1,5 +1,7 @@
 # ForgeCore Engine
 
+[![CI](https://github.com/Goplej/ForgeCore-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Goplej/ForgeCore-Engine/actions/workflows/ci.yml)
+
 A small, dependency-light **C++17 game engine** with a clean component-based
 (ECS) architecture, supporting **2D and 3D rendering**, a shared lighting
 model, 2D/3D physics, procedural audio, and an immediate-mode UI.
