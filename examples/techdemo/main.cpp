@@ -40,7 +40,7 @@ struct Demo {
   Entity pointLight, torus, cube, ball3d, player;
   std::vector<Entity> balls2d;
   std::vector<Entity> orbs;
-  uint32_t texOrb, texOrb2, texGlow, texCheck;
+  uint32_t texOrb, texOrb2, texGlow, texCheck, texPlayer;
 
   // toggles / motion
   bool spin = true, gravity = true, lights = true;
@@ -81,6 +81,7 @@ static void build_scene(Engine& e, Demo& d) {
   d.texOrb2 = r->create_texture(64, 64, orb2.data());
   d.texGlow = r->create_texture(64, 64, glow.data());
   d.texCheck = r->create_texture(64, 64, check.data());
+  d.texPlayer = r->create_texture(64, 64, make_player(64).data());
 
   // --- 3D camera + lights ---------------------------------------------------
   Camera cam3dc;
@@ -144,12 +145,26 @@ static void build_scene(Engine& e, Demo& d) {
     d.camBar = sc.spawn(cb, Viewport{0, regionH, d.W, d.barH}, Transform{{0, 0, 10}});
   }
 
+  // arena: floor + walls at the visible edges (balls bounce inside the view)
   sc.spawn(Transform{{0, -300}}, Collider2D{{900, 40}});
-  sc.spawn(Transform{{-430, 0}}, Collider2D{{40, 900}});
-  sc.spawn(Transform{{430, 0}}, Collider2D{{40, 900}});
-
+  sc.spawn(Transform{{-316, 0}}, Collider2D{{24, 900}});
+  sc.spawn(Transform{{316, 0}}, Collider2D{{24, 900}});
+  const Vec4 kFloor{0.09f, 0.105f, 0.17f, 1};
+  const Vec4 kEdge{0.36f, 0.48f, 0.76f, 1};
+  { Sprite f; f.size = {700, 40}; f.tint = kFloor; f.depth = 0;
+    sc.spawn(Transform{{0, -300}}, f, CameraOf{d.cam2d}); }
+  { Sprite f; f.size = {700, 3}; f.tint = kEdge; f.depth = 0;
+    sc.spawn(Transform{{0, -280}}, f, CameraOf{d.cam2d}); }
+  { Sprite w1; w1.size = {24, 700}; w1.tint = kFloor; w1.depth = 0;
+    sc.spawn(Transform{{-316, 0}}, w1, CameraOf{d.cam2d});
+    Sprite e1; e1.size = {3, 700}; e1.tint = kEdge; e1.depth = 0;
+    sc.spawn(Transform{{-303, 0}}, e1, CameraOf{d.cam2d});
+    Sprite w2; w2.size = {24, 700}; w2.tint = kFloor; w2.depth = 0;
+    sc.spawn(Transform{{316, 0}}, w2, CameraOf{d.cam2d});
+    Sprite e2; e2.size = {3, 700}; e2.tint = kEdge; e2.depth = 0;
+    sc.spawn(Transform{{303, 0}}, e2, CameraOf{d.cam2d}); }
   {
-    Sprite ps; ps.texture = d.texCheck; ps.size = {34, 34}; ps.depth = 5;
+    Sprite ps; ps.texture = d.texPlayer; ps.size = {34, 34}; ps.depth = 5;
     RigidBody2D pb; pb.radius = 17; pb.restitution = 0.05f; pb.mass = 2.0f;
     d.player = sc.spawn(Transform{{-140, -260}}, ps, pb, CameraOf{d.cam2d});
   }
@@ -382,6 +397,7 @@ int main(int argc, char** argv) {
     if (a == "--stream") stream = true;
     else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
     else if (a == "--screenshot" && i + 1 < argc) screenshot = argv[++i];
+    else if (a == "--renderer" && i + 1 < argc) cfg.renderer = argv[++i];
     else if (a == "--width" && i + 1 < argc) cfg.window.width = std::atoi(argv[++i]);
     else if (a == "--height" && i + 1 < argc) cfg.window.height = std::atoi(argv[++i]);
     else if (a == "--help" || a == "-h") {

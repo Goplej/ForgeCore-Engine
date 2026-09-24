@@ -27,6 +27,7 @@ std::vector<uint8_t> make_radial_glow(int size, uint8_t r, uint8_t g, uint8_t b)
 std::vector<uint8_t> make_gradient(int size, uint8_t top_r, uint8_t top_g, uint8_t top_b,
                                    uint8_t bot_r, uint8_t bot_g, uint8_t bot_b);
 std::vector<uint8_t> make_orb(int size, uint8_t r, uint8_t g, uint8_t b);
+std::vector<uint8_t> make_player(int size);  // little 2D bot (body, visor, eyes, feet)
 std::vector<uint8_t> make_grid_tex(int size, uint8_t bg_r, uint8_t bg_g, uint8_t bg_b,
                                    uint8_t line_r, uint8_t line_g, uint8_t line_b, int lines);
 

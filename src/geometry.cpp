@@ -184,6 +184,48 @@ std::vector<uint8_t> make_orb(int size, uint8_t r, uint8_t g, uint8_t b) {
   return t;
 }
 
+std::vector<uint8_t> make_player(int size) {
+  std::vector<uint8_t> t((size_t)size * size * 4);
+  float u = (size - 1.0f) / 64.0f;  // design space is 64x64
+  auto inside_rrect = [&](float x, float y, float x0, float y0, float x1, float y1, float rad) {
+    if (x < x0 || x > x1 || y < y0 || y > y1) return false;
+    float cx = std::max(x0 + rad, std::min(x, x1 - rad));
+    float cy = std::max(y0 + rad, std::min(y, y1 - rad));
+    float dx = x - cx, dy = y - cy;
+    return dx * dx + dy * dy <= rad * rad;
+  };
+  for (int py = 0; py < size; ++py) {
+    for (int px = 0; px < size; ++px) {
+      float x = (px + 0.5f) / u, y = (py + 0.5f) / u;
+      // antenna
+      if (x >= 29 && x < 35 && y >= 4 && y < 11)
+        put_pixel(t, px, py, size, 40, 110, 120);
+      else if (x >= 28 && x < 36 && y >= 1 && y < 6)
+        put_pixel(t, px, py, size, 120, 240, 255);
+      // feet
+      else if (inside_rrect(x, y, 14, 49, 27, 59, 3) || inside_rrect(x, y, 37, 49, 50, 59, 3))
+        put_pixel(t, px, py, size, 34, 58, 72);
+      // body (rounded rect with top-light shading)
+      else if (inside_rrect(x, y, 8, 9, 56, 51, 11)) {
+        float f = 1.0f - ((y - 9) / 42.0f) * 0.4f;
+        put_pixel(t, px, py, size, (uint8_t)(70 * f + 20), (uint8_t)(190 * f + 15),
+                  (uint8_t)(210 * f + 15));
+      }
+    }
+  }
+  // visor + eyes on top
+  for (int py = 0; py < size; ++py) {
+    for (int px = 0; px < size; ++px) {
+      float x = (px + 0.5f) / u, y = (py + 0.5f) / u;
+      if (inside_rrect(x, y, 14, 17, 50, 33, 5))
+        put_pixel(t, px, py, size, 12, 20, 38);
+      if ((x >= 19 && x < 27 && y >= 21 && y < 30) || (x >= 37 && x < 45 && y >= 21 && y < 30))
+        put_pixel(t, px, py, size, 150, 245, 255);
+    }
+  }
+  return t;
+}
+
 std::vector<uint8_t> make_grid_tex(int size, uint8_t br, uint8_t bg, uint8_t bb, uint8_t lr,
                                    uint8_t lg, uint8_t lb, int lines) {
   std::vector<uint8_t> t((size_t)size * size * 4);

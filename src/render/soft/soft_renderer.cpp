@@ -189,18 +189,21 @@ void SoftRenderer::draw(MeshId id) {
       Vec3 wn = model_.transformDir({v[vi + 3], v[vi + 4], v[vi + 5]});
       s[k] = {wp.x, wp.y, wp.z, wn.x, wn.y, wn.z, v[vi + 6], v[vi + 7]};
     }
+    // Clip-space barycentrics: lam_k is 1 at cv[k], 0 at the other two.
+    // (These also weight the *original* 3D vertex attributes, so clipped
+    // vertices interpolate correctly.)
     auto attr_for = [&](const ClipVertex& c, NdcVertex& o) {
-      float l1 = ((y1 - y2) * c.x + (x2 - x1) * c.y + x1 * y2 - x2 * y1) / den;
-      float l2 = ((y2 - y0) * c.x + (x0 - x2) * c.y + x2 * y0 - x0 * y2) / den;
-      float l0 = 1.0f - l1 - l2;
-      o.wx = s[0].wx * l0 + s[1].wx * l1 + s[2].wx * l2;
-      o.wy = s[0].wy * l0 + s[1].wy * l1 + s[2].wy * l2;
-      o.wz = s[0].wz * l0 + s[1].wz * l1 + s[2].wz * l2;
-      o.nx = s[0].nx * l0 + s[1].nx * l1 + s[2].nx * l2;
-      o.ny = s[0].ny * l0 + s[1].ny * l1 + s[2].ny * l2;
-      o.nz = s[0].nz * l0 + s[1].nz * l1 + s[2].nz * l2;
-      o.u = s[0].u * l0 + s[1].u * l1 + s[2].u * l2;
-      o.v = s[0].vv * l0 + s[1].vv * l1 + s[2].vv * l2;
+      float lam0 = ((y1 - y2) * c.x + (x2 - x1) * c.y + x1 * y2 - x2 * y1) / den;
+      float lam1 = ((y2 - y0) * c.x + (x0 - x2) * c.y + x2 * y0 - x0 * y2) / den;
+      float lam2 = 1.0f - lam0 - lam1;
+      o.wx = s[0].wx * lam0 + s[1].wx * lam1 + s[2].wx * lam2;
+      o.wy = s[0].wy * lam0 + s[1].wy * lam1 + s[2].wy * lam2;
+      o.wz = s[0].wz * lam0 + s[1].wz * lam1 + s[2].wz * lam2;
+      o.nx = s[0].nx * lam0 + s[1].nx * lam1 + s[2].nx * lam2;
+      o.ny = s[0].ny * lam0 + s[1].ny * lam1 + s[2].ny * lam2;
+      o.nz = s[0].nz * lam0 + s[1].nz * lam1 + s[2].nz * lam2;
+      o.u = s[0].u * lam0 + s[1].u * lam1 + s[2].u * lam2;
+      o.v = s[0].vv * lam0 + s[1].vv * lam1 + s[2].vv * lam2;
       project(c, o.x, o.y, o.z);
     };
 

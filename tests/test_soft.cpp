@@ -36,7 +36,32 @@ int main() {
   auto at = [&](int x, int y) { return (px[(y * 100 + x) * 3] << 16) | (px[(y * 100 + x) * 3 + 1] << 8) |
                                         px[(y * 100 + x) * 3 + 2]; };
   printf("center(50,50)=%06x corner(2,2)=%06x\n", at(50, 50), at(2, 2));
+  int ok = at(50, 50) == 0xff0000 && at(2, 2) == 0;
+
+  // Textured sprite: a 2x2 red/blue checker sampled through builtin_quad must
+  // land in the correct half of the quad (barycentric label regression).
+  {
+    uint8_t tex[2 * 2 * 4] = {255, 0, 0, 255,  0, 0, 255, 255,
+                              0, 0, 255, 255,  255, 0, 0, 255};
+    MeshId tid = r.create_texture(2, 2, tex);
+    r.clear(0, 0, 0, 1);
+    r.set_matrix("model", Mat4::identity());
+    Material m;
+    m.baseColor = {1, 1, 1, 1};
+    r.set_material(m);
+    r.bind_texture(tid);
+    r.draw(r.builtin_quad());
+    r.end_frame();
+    r.read_frame_rgb8(px.data(), 100, 100);
+    // quad covers x,y in [25,75); u goes with x, v (flipped) with y:
+    // top-left (30,30)  -> texel (0,0) = red
+    // top-right (70,30) -> texel (1,0) = blue
+    // bottom-right (70,70) -> texel (1,1) = red
+    uint32_t tl = at(30, 30), tr = at(70, 30), br = at(70, 70);
+    printf("tex tl=%06x tr=%06x br=%06x\n", tl, tr, br);
+    ok = ok && tl == 0xff0000 && tr == 0x0000ff && br == 0xff0000;
+  }
   printf("tris=%llu px=%llu\n", (unsigned long long)r.triangles_rasterized(),
          (unsigned long long)r.pixels_shaded());
-  return (at(50, 50) == 0xff0000 && at(2, 2) == 0) ? 0 : 1;
+  return ok ? 0 : 1;
 }
