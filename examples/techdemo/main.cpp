@@ -28,6 +28,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace fc;
@@ -348,7 +349,7 @@ static void draw_hud(Engine& e, Demo& d) {
   begin_ui(d.camBar, 0, regionH);
   ui.rect(0, 0, d.W, d.barH, {0.05f, 0.06f, 0.10f, 1});
   ui.rect(0, 0, d.W, 1, kBorder);
-  ui.text(std::string("FORGECORE ENGINE v0.1.0   |   BACKEND: ") + e.renderer_name() +
+  ui.text(std::string("FORGECORE ENGINE v0.2.0   |   BACKEND: ") + e.renderer_name() +
               std::string("   |   ") + std::to_string(d.W) + "x" + std::to_string(d.H),
           12, 9, 11, kText);
   ui.text("[F1]SPIN [F2]GRAVITY [F3]LIGHTS [R]RESET", d.W - 340, 9, 11, kDim);
@@ -384,6 +385,39 @@ struct StatsSystem : System {
   }
 };
 
+// Collects per-frame render-pass times for `--bench N`. Runs inside the
+// render pass, so it observes the previous frame's raw render_ms; sample 0
+// (startup / shader-cache warmup) is dropped from the summary.
+struct BenchSystem : System {
+  std::vector<float>* samples;
+  const char* name() const override { return "Bench"; }
+  void update(Engine& e, float) override { samples->push_back(e.frame().render_ms); }
+};
+
+static void print_bench_summary(Engine& e, std::vector<float> samples, int threads_cfg) {
+  // drop the warmup sample (first frame, cold caches)
+  if (!samples.empty()) samples.erase(samples.begin());
+  if (samples.empty()) return;
+  std::vector<float> s = samples;
+  std::sort(s.begin(), s.end());
+  double avg = 0;
+  for (float v : s) avg += v;
+  avg /= (double)s.size();
+  size_t p95i = (size_t)((double)(s.size() - 1) * 0.95 + 0.5);
+  Renderer::FrameStats st = e.renderer()->frame_stats();
+  double fill = 100.0 * (double)st.pixels_shaded / ((double)e.window_width() * e.window_height());
+  unsigned hc = std::thread::hardware_concurrency();
+  int auto_t = hc ? (int)(hc < 4 ? hc : 4) : 1;
+  std::printf("[bench] frames=%zu renderer=%s threads=%s (%d)\n"
+              "[bench] render ms: avg=%.2f min=%.2f p95=%.2f max=%.2f\n"
+              "[bench] last frame: triangles=%llu pixels=%llu fill=%.1f%%\n",
+              s.size(), e.renderer_name().c_str(),
+              threads_cfg > 0 ? "fixed" : "auto", threads_cfg > 0 ? threads_cfg : auto_t,
+              avg, (double)s.front(), (double)s[p95i], (double)s.back(),
+              (unsigned long long)st.triangles_rasterized,
+              (unsigned long long)st.pixels_shaded, fill);
+}
+
 // -------------------------------------------------------------------- main
 
 int main(int argc, char** argv) {
@@ -391,24 +425,34 @@ int main(int argc, char** argv) {
   cfg.window.title = "ForgeCore Engine - Tech Demo";
   bool stream = false;
   int frames = 0;
+  int bench = 0;
+  int threads = 0;
   std::string screenshot;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--stream") stream = true;
     else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
+    else if (a == "--bench" && i + 1 < argc) bench = std::atoi(argv[++i]);
+    else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
     else if (a == "--screenshot" && i + 1 < argc) screenshot = argv[++i];
     else if (a == "--renderer" && i + 1 < argc) cfg.renderer = argv[++i];
     else if (a == "--width" && i + 1 < argc) cfg.window.width = std::atoi(argv[++i]);
     else if (a == "--height" && i + 1 < argc) cfg.window.height = std::atoi(argv[++i]);
     else if (a == "--help" || a == "-h") {
       std::printf("usage: techdemo [--width W] [--height H] [--stream] [--frames N] "
-                  "[--screenshot out.ppm]\n");
+                  "[--screenshot out.ppm] [--renderer auto|soft|gl] [--threads N] "
+                  "[--bench N]\n"
+                  "  --threads N  CPU rasterizer workers (1 = serial, 0/default = "
+                  "min(4, cores))\n"
+                  "  --bench N    run N frames, print render ms avg/min/p95/max + fill\n");
       return 0;
     }
   }
   cfg.stream = stream;
-  cfg.frame_limit = frames;
+  cfg.renderer_threads = threads;
+  cfg.frame_limit = bench > 0 ? (frames > 0 ? std::max(frames, bench) : bench) : frames;
   cfg.screenshot_path = screenshot;
+  if (bench > 0) cfg.target_fps = 0;  // benchmark: no frame pacing
 
   Engine engine(cfg);
   Demo d;
@@ -435,6 +479,12 @@ int main(int argc, char** argv) {
     st->d = &d;
     engine.add_render_system(std::move(st));
   }
+  std::vector<float> bench_samples;
+  if (bench > 0) {
+    auto b = std::make_unique<BenchSystem>();
+    b->samples = &bench_samples;
+    engine.add_render_system(std::move(b));
+  }
 
   // relay audio events to the browser (headless preview)
   engine.audio().set_listener([&](const AudioEvent& ev) {
@@ -451,6 +501,8 @@ int main(int argc, char** argv) {
   });
 
   engine.run([&](Engine& e) { build_scene(e, d); });
+
+  if (bench > 0) print_bench_summary(engine, std::move(bench_samples), threads);
 
   std::printf("ForgeCore tech demo finished: renderer=%s window=%s\n",
               engine.renderer_name().c_str(), engine.window_backend_name().c_str());

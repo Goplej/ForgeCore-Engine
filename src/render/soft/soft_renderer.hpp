@@ -1,15 +1,27 @@
 #pragma once
 #include "fc/render.hpp"
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
 namespace fc {
 
+class SoftWorkerPool;  // persistent raster worker threads (defined in .cpp)
+
 // CPU rasterizer implementing the ForgeCore Renderer contract.
 // Z-buffer, alpha blending, scissor, near-plane clipping, per-fragment
 // lighting (same model as the GL shader), nearest-neighbor texturing.
+//
+// Threading: draw() collects screen-space triangles, then rasterizes them
+// with a worker pool over area-balanced scanline bands. Every pixel is
+// owned by exactly one band, and triangles are visited in submission order
+// within each band, so the output is pixel-identical to the serial path
+// (verified by a regression test in tests/test_soft.cpp).
 class SoftRenderer : public Renderer {
  public:
+  SoftRenderer();  // out of line: holds a unique_ptr<SoftWorkerPool>
+  ~SoftRenderer() override;
+
   const char* name() const override { return "soft (CPU rasterizer)"; }
 
   bool begin_frame(int width, int height) override;
@@ -35,6 +47,11 @@ class SoftRenderer : public Renderer {
   void draw(MeshId id) override;
   MeshId builtin_quad() override;
 
+  void set_threads(int n) override;  // 0 = auto (min(4, hardware cores))
+  FrameStats frame_stats() const override {
+    return {triangles_rasterized_, pixels_shaded_};
+  }
+
   uint64_t triangles_rasterized() const { return triangles_rasterized_; }
   uint64_t pixels_shaded() const { return pixels_shaded_; }
 
@@ -57,12 +74,20 @@ class SoftRenderer : public Renderer {
     float nx, ny, nz;  // world normal
     float u, v;
   };
+  // A fully clipped, screen-space triangle ready for row-band rasterization.
+  struct RasterTri {
+    NdcVertex a, b, c;
+    float s2;         // 2*abs(area), > 0
+    bool ccw;
+    int ix0, ix1, iy0, iy1;  // screen bbox (clamped to framebuffer)
+  };
 
   bool clip_triangle(const ClipVertex in[3], ClipVertex out[8], int* outn);
   void project(const ClipVertex& c, float& sx, float& sy, float& sz);
-  void raster_triangle(const NdcVertex a, const NdcVertex b, const NdcVertex c);
-  void plot_pixel(float sx, float sy, float depth, const NdcVertex& a, const NdcVertex& b,
-                  const NdcVertex& c, float wa, float wb, float wc);
+  void raster_rows(const RasterTri& t, int ry0, int ry1, uint64_t& px_shaded);
+  void flush_batch();
+  int resolve_threads() const;
+  void ensure_pool(int threads);
 
   int W_ = 0, H_ = 0;
   std::vector<uint8_t> front_, back_;   // RGBA8
@@ -80,8 +105,18 @@ class SoftRenderer : public Renderer {
   std::unordered_map<uint32_t, Tex> textures_;
   std::unordered_map<MeshId, MeshData> meshes_;
   uint32_t next_id_ = 1;
+  MeshId quad_id_ = 0;  // per-instance builtin quad cache
   uint64_t triangles_rasterized_ = 0;
   uint64_t pixels_shaded_ = 0;
+
+  // threaded rasterization
+  std::vector<RasterTri> batch_;
+  std::vector<int> band_start_;
+  std::vector<int> row_weight_;
+  std::vector<uint64_t> band_px_, band_tri_;
+  std::unique_ptr<SoftWorkerPool> pool_;
+  int pool_threads_ = 0;
+  int threads_ = 0;  // 0 = auto
 };
 
 }  // namespace fc

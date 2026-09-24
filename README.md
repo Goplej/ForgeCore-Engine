@@ -55,6 +55,7 @@ build/bin/techdemo --width 1280 --height 720
 build/bin/techdemo --frames 300 --screenshot out.ppm   # headless capture
 build/bin/techdemo --stream                          # stream via /dev/shm (below)
 build/bin/techdemo --renderer gl|soft|auto
+build/bin/techdemo --threads 2 --bench 300         # CPU rasterizer workers + render benchmark
 ```
 
 ### Controls

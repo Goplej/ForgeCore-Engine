@@ -15,6 +15,8 @@
 
 namespace fc {
 
+inline constexpr int kMaxPointLights = 4;
+
 // ---------------------------------------------------------------- types ---
 
 struct Material {
@@ -37,7 +39,7 @@ struct PointLightSource {
 
 struct FrameLights {
   DirLightSource dir;
-  PointLightSource points[4];
+  PointLightSource points[kMaxPointLights];
   int numPoints = 0;
 };
 
@@ -47,30 +49,64 @@ enum class ProgramKind { Lit, Unlit };
 // interleaved vertex stream {pos(3) normal(3) uv(2)} + uint32 index list.
 using MeshId = uint32_t;
 
+// pow(x, e) via exponentiation by squaring on the integer-rounded exponent.
+// Visually indistinguishable from libm pow for typical integer shininess
+// values (16, 32, 48...) and only a handful of multiplies — no libm call.
+inline float fast_blinn_pow(float x, float e) {
+  if (x <= 0.0f) return 0.0f;
+  int n = (int)(e + 0.5f);
+  if (n < 1) n = 1;
+  float r = 1.0f, b = x;
+  for (;;) {
+    if (n & 1) r *= b;
+    n >>= 1;
+    if (!n) break;
+    b *= b;
+  }
+  return r;
+}
+
 // Shared per-fragment lighting model (SoftRenderer executes this on the CPU;
 // the GL backend has a GLSL shader implementing the identical model).
+// point_mask (when non-null) gates per-point-light contribution; the CPU
+// rasterizer passes a per-triangle mask so out-of-reach lights are culled
+// before any per-pixel work. Skipped lights contribute exactly zero anyway
+// (attenuation reaches 0 at the radius), so results are unchanged.
 inline Vec3 light_fragment(const Vec3& N, const Vec3& V, const Vec3& P,
                            const Material& mat, const FrameLights& L,
-                           const Vec3& emissiveBoost = Vec3{0, 0, 0}) {
+                           const Vec3& emissiveBoost = Vec3{0, 0, 0},
+                           const bool* point_mask = nullptr) {
   Vec3 albedo = mat.baseColor.xyz();
   Vec3 col = Vec3{0.12f, 0.13f, 0.16f} * albedo;  // ambient fill so shadowed faces stay readable
   // directional
   {
-    float ndl = std::max(0.0f, -N.dot(L.dir.direction));
-    Vec3 H = (L.dir.direction * -1.0f + V).normalized();
-    float spec = std::pow(std::max(0.0f, N.dot(H)), mat.shininess) * mat.specularStrength;
-    col = col + L.dir.color * (ndl * albedo + Vec3{spec, spec, spec});
+    float ndl = -N.dot(L.dir.direction);
+    if (ndl > 0.0f) {  // gate: no diffuse -> no specular either
+      Vec3 Ld = L.dir.direction * -1.0f;
+      Vec3 H = Ld + V;
+      float hl2 = H.lengthSq();
+      float inv = hl2 > 1e-12f ? 1.0f / std::sqrt(hl2) : 0.0f;  // reciprocal normalization
+      float ndh = N.dot(H) * inv;
+      float spec = fast_blinn_pow(ndh, mat.shininess) * mat.specularStrength;
+      col = col + L.dir.color * (ndl * albedo + Vec3{spec, spec, spec});
+    }
   }
   for (int i = 0; i < L.numPoints; ++i) {
+    if (point_mask && !point_mask[i]) continue;
     const PointLightSource& pl = L.points[i];
     Vec3 toL = pl.position - P;
-    float d = toL.length();
-    float atten = std::max(0.0f, 1.0f - d / pl.radius);
+    float d2 = toL.lengthSq();
+    if (d2 >= pl.radius * pl.radius) continue;  // out of range: would contribute 0
+    float d = std::sqrt(d2);
+    float atten = 1.0f - d / pl.radius;
     atten *= atten;
-    Vec3 Ld = d > 1e-5f ? toL * (1.0f / d) : Vec3{0, 1, 0};
-    float ndl = std::max(0.0f, N.dot(Ld));
-    Vec3 H = (Ld + V).normalized();
-    float spec = std::pow(std::max(0.0f, N.dot(H)), mat.shininess) * mat.specularStrength;
+    float inv = d > 1e-5f ? 1.0f / d : 0.0f;
+    float ndl = std::max(0.0f, N.dot(toL) * inv);
+    Vec3 H = toL * inv + V;
+    float hl2 = H.lengthSq();
+    float hinv = hl2 > 1e-12f ? 1.0f / std::sqrt(hl2) : 0.0f;  // reciprocal normalization
+    float ndh = N.dot(H) * hinv;
+    float spec = fast_blinn_pow(ndh, mat.shininess) * mat.specularStrength;
     col = col + pl.color * atten * (ndl * albedo + Vec3{spec, spec, spec});
   }
   col = col + emissiveBoost;
@@ -84,6 +120,18 @@ class Renderer {
   virtual ~Renderer() = default;
 
   virtual const char* name() const = 0;
+
+  // Per-frame rasterization counters (reset in begin_frame). The CPU
+  // rasterizer fills both; the GL backend reports triangle counts only.
+  struct FrameStats {
+    uint64_t triangles_rasterized = 0;
+    uint64_t pixels_shaded = 0;
+  };
+  virtual FrameStats frame_stats() const { return {}; }
+
+  // Worker hint for the CPU rasterizer: 1 = serial path, 0 = auto
+  // (min(4, hardware cores)). No-op on backends that don't rasterize on CPU.
+  virtual void set_threads(int) {}
 
   // Frame lifecycle. begin returns false if the frame could not start.
   virtual bool begin_frame(int width, int height) = 0;

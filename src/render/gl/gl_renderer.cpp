@@ -154,6 +154,7 @@ GLint GLRenderer::loc(unsigned prog, const char* name) {
 bool GLRenderer::begin_frame(int width, int height) {
   W_ = width;
   H_ = height;
+  triangles_drawn_ = 0;
   auto viewport = pf<glViewportFn>(g_, g_.glViewport_p);
   viewport(0, 0, width, height);
   pf<glEnableFn>(g_, g_.glEnable_p)(GL_SCISSOR_TEST);
@@ -302,12 +303,11 @@ MeshId GLRenderer::builtin_quad() {
       -0.5f, 0.5f, 0, 0, 0, 1, 0, 0,
   };
   static uint32_t idx[6] = {0, 1, 2, 0, 2, 3};
-  static MeshId id = 0;
-  if (!id) {
+  if (!quad_id_) {
     Mesh m{verts, 4, idx, 6};
-    id = create_mesh(m);
+    quad_id_ = create_mesh(m);
   }
-  return id;
+  return quad_id_;
 }
 
 void GLRenderer::draw(MeshId id) {
@@ -327,6 +327,7 @@ void GLRenderer::draw(MeshId id) {
   vptr(2, 2, FC_GL_FLOAT, kFalse, 32, (const void*)20);
   bind(GL_ELEMENT_ARRAY_BUFFER, d.ibo);
   draw(GL_TRIANGLES, d.indexCount, GL_UNSIGNED_INT, (const void*)0);
+  triangles_drawn_ += (uint64_t)(d.indexCount / 3);
 }
 
 }  // namespace fc
